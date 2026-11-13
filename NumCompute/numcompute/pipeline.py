@@ -278,6 +278,47 @@ class Pipeline:
         self._fit(X, y)
         return self
 
+    def partial_fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None) -> "Pipeline":
+        """Apply streaming updates to all transformer and estimator steps."""
+        current = np.asarray(X)
+        for name, transformer in self._transformers():
+            if hasattr(transformer, "partial_fit"):
+                if current.ndim == 2 and isinstance(
+                    transformer, (Imputer, MinMaxScaler, OneHotEncoder, StandardScaler)
+                ):
+                    outputs = []
+                    fitted = []
+                    for index in range(current.shape[1]):
+                        feature_transformer = transformer if index == 0 else deepcopy(transformer)
+                        feature = current[:, index]
+                        feature_transformer.partial_fit(feature)
+                        fitted.append(feature_transformer)
+                        outputs.append(self._as_2d_output(feature_transformer.transform(feature), current.shape[0]))
+                    current = np.concatenate(outputs, axis=1)
+                    self._fitted_transformers[name] = fitted
+                    self._columnwise_steps.add(name)
+                else:
+                    transformer.partial_fit(current)
+                    current = transformer.transform(current)
+            else:
+                transformer = _require_transformer(
+                    transformer,
+                    "non-final pipeline steps must implement fit and transform.",
+                )
+                transformer.fit(current)
+                current = transformer.transform(current)
+        final = self.steps[-1][1] if self.steps else None
+        if final is not None and hasattr(final, "partial_fit"):
+            if y is None:
+                raise ValueError("y is required when the final pipeline step is an estimator.")
+            final.partial_fit(current, y)
+        elif final is not None and hasattr(final, "fit"):
+            if y is None:
+                raise ValueError("y is required when the final pipeline step is an estimator.")
+            final.fit(current, y)
+        self._is_fitted = True
+        return self
+
     def transform(self, X: npt.ArrayLike) -> npt.ArrayLike:
         """Transform X through transformer steps, returning the final feature array.
 
