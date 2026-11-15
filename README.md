@@ -1,4 +1,6 @@
-# NumCompute
+# NumCompute-Stream and NumCompute
+
+The standalone package described by the current specification is documented in [NUMCOMPUTE_STREAM.md](./NUMCOMPUTE_STREAM.md). Its public import name is `numcompute_stream`.
 
 NumCompute is a numerical computing toolkit implemented using **plain Python and NumPy**.
 
@@ -52,7 +54,10 @@ The tree below shows the project layout and modules.
 │   ├── test_benchmarking.py
 │   └── test_streaming_and_package.py
 ├── demo/
-│   └── quickstart.ipynb
+│   ├── quickstart.ipynb
+│   ├── quickstart_stream.ipynb
+│   ├── stream_demo.ipynb
+│   └── train_titanic.py
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── .gitignore
@@ -110,6 +115,28 @@ python -m pip install jupyter
 ```
 
 The installed package is named `numcompute` and can be imported from Python scripts or Jupyter notebooks.
+
+---
+
+## Benchmarking
+
+The project includes a simple benchmark script for comparing loop-based and vectorised implementations, and for evaluating the effect of different `buffer_size` settings under streaming retraining.
+
+```bash
+python benchmark/vectorized_vs_loop.py
+```
+
+This prints timing summaries, output-agreement checks, environment details, and accuracy/retraining comparisons for several buffer sizes.
+
+Train the streaming package's decision-tree pipeline on the included Titanic CSV and evaluate it on a deterministic held-out split:
+
+```powershell
+python demo/train_titanic.py
+```
+
+The training example excludes target-derived columns, imputes missing feature values, and prints held-out accuracy and a confusion matrix.
+
+For the complete interactive workflow, open `demo/quickstart_stream.ipynb` and run its cells from top to bottom. It explores the local Titanic data, trains and evaluates a batch model, trains a streaming model on CSV chunks, and displays the accompanying visualizations.
 
 ---
 
