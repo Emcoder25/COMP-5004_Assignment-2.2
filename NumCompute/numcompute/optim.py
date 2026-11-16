@@ -45,12 +45,20 @@ def grad(
         raise ValueError("method must be 'central' or 'forward'.")
 
     x_array: NDArray[np.float64] = np.asarray(x, dtype=float)
+    if not np.all(np.isfinite(x_array)):
+        raise ValueError("x must contain finite values.")
+    if not np.all(np.isfinite(x_array)):
+        raise ValueError("x must contain finite values.")
 
     if x_array.ndim == 0:
         x0: float = float(x_array)
         if method == "central":
-            return (f(x0 + h) - f(x0 - h)) / (2 * h)
-        return (f(x0 + h) - f(x0)) / h
+            result = (f(x0 + h) - f(x0 - h)) / (2 * h)
+        else:
+            result = (f(x0 + h) - f(x0)) / h
+        if not np.isfinite(result):
+            raise ValueError("gradient result is non-finite.")
+        return result
 
     gradient: NDArray[np.float64] = np.zeros_like(x_array, dtype=float)
     # Forward differences reuse this value instead of reevaluating f(x).
@@ -69,6 +77,8 @@ def grad(
         else:
             gradient[index] = (f(x_plus) - baseline) / h
 
+    if not np.all(np.isfinite(gradient)):
+        raise ValueError("gradient result is non-finite.")
     return gradient
 
 
@@ -117,6 +127,8 @@ def jacobian(
         x_array = x_array.reshape(1)
 
     output: NDArray[np.float64] = np.asarray(F(x_array), dtype=float).reshape(-1)
+    if not np.all(np.isfinite(output)):
+        raise ValueError("Jacobian result is non-finite.")
     # Each column of the Jacobian describes one input; each row describes one output.
     jac: NDArray[np.float64] = np.zeros((output.size, x_array.size), dtype=float)
 

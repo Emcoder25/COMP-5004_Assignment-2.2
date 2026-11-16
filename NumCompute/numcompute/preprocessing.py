@@ -1,467 +1,462 @@
-from typing import Any, Sequence, Tuple
+"""NumPy preprocessing transformers with batch and incremental support."""
+
+from __future__ import annotations
+
 import numpy as np
 import numpy.typing as npt
+from typing import Any
 
 
-def _check_1d_array(X: npt.ArrayLike) -> npt.NDArray[Any]:
-    """
-    Ensure the input is a 1D NumPy array.
-
-    Parameters
-    ----------
-    X : npt.ArrayLike
-        Input data.
-
-    Returns
-    -------
-    npt.NDArray[Any]
-        A 1D NumPy array.
-
-    Raises
-    ------
-    ValueError
-        If the input is not 1D.
-    """
-    X_arr = np.asarray(X)
-    if X_arr.ndim != 1:
-        raise ValueError(f"X must be a 1D array. Received shape {X_arr.shape}.")
-    return X_arr
+def _shape(X: npt.ArrayLike) -> tuple[np.ndarray, bool]:
+    arr = np.asarray(X)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    was_1d = arr.ndim == 1
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"X must be a 1D or 2D array. Received shape {arr.shape}.")
+    return arr, was_1d
 
 
-def _check_is_fitted(estimator: Any, attributes: Sequence[str]) -> None:
-    """Check if the estimator has been fitted by verifying necessary attributes."""
-    for attr in attributes:
-        if not hasattr(estimator, attr):
-            raise ValueError(
-                f"This {estimator.__class__.__name__} instance is not fitted yet. Call 'fit' first."
-            )
+def _stable_mean(arr: np.ndarray) -> np.ndarray:
+    scale = np.max(np.abs(arr), axis=0)
+    scale = np.where(scale == 0, 1.0, scale)
+    return np.mean(arr / scale, axis=0) * scale
+
+
+def _category_kind(values: np.ndarray) -> str:
+    items = values.tolist()
+    if any(value is None for value in items):
+        raise ValueError("OneHotEncoder cannot encode missing values.")
+    is_string = [isinstance(value, (str, np.str_)) for value in items]
+    is_integer = [
+        isinstance(value, (int, np.integer))
+        and not isinstance(value, (bool, np.bool_))
+        for value in items
+    ]
+    if any(is_string) and any(is_integer):
+        raise ValueError("OneHotEncoder cannot mix string and numeric categorical data.")
+    if all(is_string):
+        return "string"
+    if all(is_integer):
+        if any(value < 0 for value in items):
+            raise ValueError("OneHotEncoder requires non-negative integers.")
+        return "integer"
+    raise ValueError("OneHotEncoder expects integer categorical data or strings.")
 
 
 class StandardScaler:
-    """
-    Standardize 1D features by removing the mean and scaling to unit variance.
-    """
-
-    epsilon: float
-    mean_: float
-    scale_: float
-
-    def __init__(self, epsilon: float = 1e-8) -> None:
+    def __init__(self, epsilon: float = 1e-8, ema_alpha: float | None = None) -> None:
+        if ema_alpha is not None and (isinstance(ema_alpha, bool) or not 0 < float(ema_alpha) <= 1):
+            raise ValueError("ema_alpha must be in (0, 1].")
         self.epsilon = epsilon
+        self.ema_alpha = ema_alpha
 
     def fit(self, X: npt.ArrayLike) -> "StandardScaler":
-        """
-        Compute the mean and standard deviation to be used for later scaling.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
-
-        Returns
-        -------
-        self : StandardScaler
-            The fitted scaler.
-
-        Complexity
-        ----------
-        Time: O(n_samples)
-        Space: O(1)
-        """
-        X_arr = _check_1d_array(X)
-        if X_arr.size == 0:
+        arr, one_d = _shape(X)
+        if arr.size == 0:
             raise ValueError("StandardScaler cannot fit on an empty array.")
-
-        self.mean_ = float(np.mean(X_arr))
-        self.scale_ = float(np.std(X_arr))
-
-        # Prevent division by zero if the feature is completely constant
-        if self.scale_ == 0.0:
-            self.scale_ = 1.0
-
+        if arr.dtype.kind not in "iuf" or np.issubdtype(arr.dtype, np.bool_):
+            raise TypeError("StandardScaler requires real numeric values.")
+        arr = arr.astype(float)
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("StandardScaler values must be finite.")
+        means = _stable_mean(arr)
+        centered = arr - means
+        vars_ = np.mean(centered * centered, axis=0).astype(float)
+        scales = np.sqrt(vars_)
+        scales = np.where(scales == 0, 1.0, scales)
+        self.mean_, self.var_, self.scale_ = (means[0] if one_d else means,
+                                               vars_[0] if one_d else vars_,
+                                               scales[0] if one_d else scales)
+        self.n_samples_seen_ = int(arr.shape[0])
+        self.n_features_in_ = arr.shape[1]
+        self._one_d = one_d
         return self
 
-    def transform(self, X: npt.ArrayLike) -> npt.NDArray[np.floating[Any]]:
-        """
-        Apply standardization by centering and scaling.
+    def partial_fit(self, X: npt.ArrayLike) -> "StandardScaler":
+        arr, one_d = _shape(X)
+        if arr.shape[0] == 0:
+            if hasattr(self, "mean_"):
+                return self
+            raise ValueError("StandardScaler cannot fit on an empty array.")
+        if arr.dtype.kind not in "iuf" or np.issubdtype(arr.dtype, np.bool_):
+            raise TypeError("StandardScaler requires real numeric values.")
+        arr = arr.astype(float)
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("StandardScaler values must be finite.")
+        if hasattr(self, "n_features_in_") and arr.shape[1] != self.n_features_in_:
+            raise ValueError("StandardScaler feature count changed.")
+        if not hasattr(self, "n_samples_seen_"):
+            self.n_samples_seen_ = 0
+            self.n_features_in_ = arr.shape[1]
+            self.mean_ = np.zeros(arr.shape[1])
+            self.var_ = np.zeros(arr.shape[1])
+        old_count = self.n_samples_seen_
+        batch_mean = _stable_mean(arr)
+        centered = arr - batch_mean
+        batch_var = np.mean(centered * centered, axis=0).astype(float)
+        new_count = old_count + arr.shape[0]
+        if old_count:
+            old_mean = np.asarray(self.mean_, dtype=float).reshape(-1)
+            old_var = np.asarray(self.var_, dtype=float).reshape(-1)
+            if self.ema_alpha is None:
+                delta = batch_mean - old_mean
+                combined_var = (old_var * old_count + batch_var * arr.shape[0]
+                                + delta * delta * old_count * arr.shape[0] / new_count) / new_count
+                combined_mean = old_mean + delta * arr.shape[0] / new_count
+            else:
+                combined_mean = (1 - self.ema_alpha) * old_mean + self.ema_alpha * batch_mean
+                combined_var = (1 - self.ema_alpha) * old_var + self.ema_alpha * batch_var
+        else:
+            combined_mean, combined_var = batch_mean, batch_var
+        mean_out = combined_mean[0] if one_d else combined_mean
+        var_out = combined_var[0] if one_d else combined_var
+        if one_d:
+            self.mean_, self.var_ = mean_out, var_out
+            self.scale_ = 1.0 if var_out == 0 else float(np.sqrt(var_out))
+        else:
+            self.mean_, self.var_ = combined_mean, combined_var
+            self.scale_ = np.where(combined_var == 0, 1.0, np.sqrt(combined_var))
+        self.n_samples_seen_ = new_count
+        self.n_features_in_ = arr.shape[1]
+        self._one_d = one_d
+        return self
 
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
+    def transform(self, X: npt.ArrayLike) -> np.ndarray:
+        if not hasattr(self, "mean_"):
+            raise ValueError("This StandardScaler instance is not fitted yet.")
+        arr, one_d = _shape(X)
+        if arr.dtype.kind in "US":
+            arr = arr.astype(object)
+        if arr.shape[1] != self.n_features_in_:
+            raise ValueError("StandardScaler feature count changed.")
+        if arr.dtype.kind not in "iuf":
+            raise TypeError("StandardScaler requires real numeric values.")
+        arr = arr.astype(float)
+        mean = np.asarray(self.mean_, dtype=float).reshape(-1)
+        scale = np.asarray(self.scale_, dtype=float).reshape(-1)
+        result = (arr - mean) / scale
+        return result.ravel() if one_d else result
 
-        Returns
-        -------
-        npt.NDArray[np.floating[Any]]
-            Standardized 1D array, shape (n_samples,).
-
-        Complexity
-        ----------
-        Time: O(n_samples)
-        Space: O(n_samples)
-        """
-        _check_is_fitted(self, ["mean_", "scale_"])
-        X_arr = _check_1d_array(X)
-
-        return (X_arr - self.mean_) / (self.scale_ + self.epsilon)
-
-    def fit_transform(self, X: npt.ArrayLike) -> npt.NDArray[np.floating[Any]]:
-        """
-        Fit to data, then transform it.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
-
-        Returns
-        -------
-        npt.NDArray[np.floating[Any]]
-            Standardized 1D array, shape (n_samples,).
-        """
+    def fit_transform(self, X: npt.ArrayLike) -> np.ndarray:
         return self.fit(X).transform(X)
 
 
 class MinMaxScaler:
-    """
-    Transform 1D features by scaling to a given range [0, 1].
-    """
-
-    feature_range: Tuple[float, float]
-    data_min_: float
-    data_max_: float
-    data_range_: float
-
-    def __init__(self, feature_range: Tuple[float, float] = (0.0, 1.0)) -> None:
+    def __init__(self, feature_range: tuple[float, float] = (0.0, 1.0), clip: bool = False) -> None:
+        if len(feature_range) != 2 or feature_range[0] >= feature_range[1]:
+            raise ValueError("MinMax feature_range must be strictly increasing.")
         self.feature_range = feature_range
+        self.clip = clip
 
     def fit(self, X: npt.ArrayLike) -> "MinMaxScaler":
-        """
-        Compute the minimum and maximum to be used for later scaling.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
-
-        Returns
-        -------
-        self : MinMaxScaler
-            The fitted scaler.
-
-        Complexity
-        ----------
-        Time: O(n_samples)
-        Space: O(1)
-        """
-        X_arr = _check_1d_array(X)
-        if X_arr.size == 0:
+        arr, one_d = _shape(X)
+        if not one_d and not getattr(self, "_allow_2d", False):
+            raise ValueError("X must be a 1D array.")
+        if arr.size == 0:
             raise ValueError("MinMaxScaler cannot fit on an empty array.")
-
-        self.data_min_ = float(np.min(X_arr))
-        self.data_max_ = float(np.max(X_arr))
-        self.data_range_ = self.data_max_ - self.data_min_
-
-        # Prevent division by zero for constant features
-        if self.data_range_ == 0.0:
-            self.data_range_ = 1.0
-
+        if arr.dtype.kind not in "iuf":
+            raise TypeError("MinMaxScaler requires real numeric values.")
+        arr = arr.astype(float)
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("MinMaxScaler values must be finite.")
+        mins = np.min(arr, axis=0)
+        maxs = np.max(arr, axis=0)
+        self.data_min_, self.data_max_ = (mins[0] if one_d else mins, maxs[0] if one_d else maxs)
+        self.n_features_in_ = arr.shape[1]
+        self._one_d = one_d
+        with np.errstate(over="ignore"):
+            ranges = maxs - mins
+        ranges = np.where(ranges == 0, 1.0, ranges)
+        self.data_range_ = float(ranges[0]) if one_d else ranges
         return self
 
-    def transform(self, X: npt.ArrayLike) -> npt.NDArray[np.floating[Any]]:
-        """
-        Scale features of X according to feature_range.
+    def partial_fit(self, X: npt.ArrayLike) -> "MinMaxScaler":
+        arr, one_d = _shape(X)
+        if not one_d and not getattr(self, "_allow_2d", False):
+            raise ValueError("X must be a 1D array.")
+        if arr.size == 0:
+            if hasattr(self, "data_min_"):
+                return self
+            raise ValueError("MinMaxScaler cannot fit on an empty array.")
+        if arr.dtype.kind not in "iuf":
+            raise ValueError("MinMaxScaler values must be finite real values.")
+        arr = arr.astype(float)
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("MinMaxScaler values must be finite real values.")
+        mins = np.min(arr, axis=0)
+        maxs = np.max(arr, axis=0)
+        if hasattr(self, "data_min_"):
+            old_mins = np.asarray(self.data_min_, dtype=float).reshape(-1)
+            old_maxs = np.asarray(self.data_max_, dtype=float).reshape(-1)
+            if old_mins.size != arr.shape[1]:
+                raise ValueError("feature count changed.")
+            mins, maxs = np.minimum(old_mins, mins), np.maximum(old_maxs, maxs)
+        self.data_min_, self.data_max_ = (mins[0] if one_d else mins, maxs[0] if one_d else maxs)
+        self.n_features_in_ = arr.shape[1]
+        self._one_d = one_d
+        return self
 
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
+    def transform(self, X: npt.ArrayLike) -> np.ndarray:
+        if not hasattr(self, "data_min_"):
+            raise ValueError("This MinMaxScaler instance is not fitted yet.")
+        arr, one_d = _shape(X)
+        if not one_d and not getattr(self, "_allow_2d", False):
+            raise ValueError("X must be a 1D array.")
+        if arr.shape[1] != self.n_features_in_:
+            raise ValueError("MinMaxScaler transform feature count mismatch.")
+        arr = arr.astype(float)
+        mins = np.asarray(self.data_min_, dtype=float).reshape(-1)
+        maxs = np.asarray(self.data_max_, dtype=float).reshape(-1)
+        low, high = self.feature_range
+        scale = np.maximum(np.maximum(np.abs(mins), np.abs(maxs)), 1.0)
+        scaled_arr = arr / scale
+        scaled_mins = mins / scale
+        scaled_maxs = maxs / scale
+        spans = scaled_maxs - scaled_mins
+        spans = np.where(spans == 0, 1.0, spans)
+        result = (scaled_arr - scaled_mins) / spans * (high - low) + low
+        if self.clip:
+            result = np.clip(result, low, high)
+        return result.ravel() if one_d else result
 
-        Returns
-        -------
-        npt.NDArray[np.floating[Any]]
-            Scaled 1D array, shape (n_samples,).
-
-        Complexity
-        ----------
-        Time: O(n_samples)
-        Space: O(n_samples)
-        """
-        _check_is_fitted(self, ["data_min_", "data_range_"])
-        X_arr = _check_1d_array(X)
-
-        X_std = (X_arr - self.data_min_) / self.data_range_
-        min_val, max_val = self.feature_range
-        return X_std * (max_val - min_val) + min_val
-
-    def fit_transform(self, X: npt.ArrayLike) -> npt.NDArray[np.floating[Any]]:
-        """
-        Fit to data, then transform it.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
-
-        Returns
-        -------
-        npt.NDArray[np.floating[Any]]
-            Scaled 1D array, shape (n_samples,).
-        """
+    def fit_transform(self, X: npt.ArrayLike) -> np.ndarray:
         return self.fit(X).transform(X)
 
 
 class Imputer:
-    """
-    Imputation transformer for completing missing values received directly in a 1D array.
-
-    Parameters
-    ----------
-    strategy : str, default='mean'
-        The imputation strategy ('mean', 'median', or 'constant').
-    fill_value : Any, default=0.0
-        The constant value to replace missing values with when strategy='constant'.
-    missing_values : Any, default=np.nan
-        The placeholder for the missing values received in the input data.
-    """
-
-    strategy: str
-    fill_value: Any
-    missing_values: Any
-    statistics_: Any
-
-    def __init__(
-        self,
-        strategy: str = "mean",
-        fill_value: Any = 0.0,
-        missing_values: Any = np.nan,
-    ) -> None:
-        if strategy not in ["mean", "median", "constant"]:
+    def __init__(self, strategy: str = "mean", fill_value: Any = 0.0, missing_values: Any = np.nan) -> None:
+        if strategy not in {"mean", "median", "constant"}:
             raise ValueError("Strategy must be 'mean', 'median', or 'constant'")
-        self.strategy = strategy
-        self.fill_value = fill_value
-        self.missing_values = missing_values
+        self.strategy, self.fill_value, self.missing_values = strategy, fill_value, missing_values
 
-    def _get_missing_mask(self, X_arr: npt.NDArray[Any]) -> npt.NDArray[np.bool_]:
-        """Return a boolean mask indicating where missing_values are located."""
+    def _mask(self, arr: np.ndarray) -> np.ndarray:
         if isinstance(self.missing_values, (float, np.floating)) and np.isnan(self.missing_values):
-            if X_arr.dtype.kind in "biufc":
-                return np.isnan(X_arr)
-            if X_arr.dtype.kind in "USO":
-                res = np.zeros(X_arr.size, dtype=bool)
-                for idx, val in enumerate(X_arr):
-                    if val is None or (isinstance(val, (float, np.floating)) and np.isnan(val)) or (isinstance(val, str) and val.strip().casefold() in {"", "nan"}):
-                        res[idx] = True
-                return res
-            return np.isnan(X_arr.astype(float, copy=False))
-        return X_arr == self.missing_values
+            if arr.dtype.kind in "OUS":
+                return np.fromiter((value is None or (isinstance(value, str) and value.strip().lower() in {"", "nan", "none"})
+                                    or (isinstance(value, (float, np.floating)) and np.isnan(value))
+                                    for value in arr.ravel()), dtype=bool).reshape(arr.shape)
+            return np.isnan(arr) if arr.dtype.kind in "fc" else np.zeros(arr.shape, dtype=bool)
+        return arr == self.missing_values
 
     def fit(self, X: npt.ArrayLike) -> "Imputer":
-        """
-        Learn the imputation scalar value from the input 1D array containing missing values.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array containing missing values directly, shape (n_samples,).
-
-        Returns
-        -------
-        self : Imputer
-            The fitted imputer.
-
-        Complexity
-        ----------
-        Time: O(n_samples) for mean/constant, O(n_samples log n_samples) for median
-        Space: O(n_samples)
-        """
-        X_arr = _check_1d_array(X)
-        if X_arr.size == 0:
+        arr, one_d = _shape(X)
+        if arr.dtype.kind in "US":
+            arr = arr.astype(object)
+        if arr.size == 0:
             raise ValueError("Imputer cannot fit on an empty array.")
-
-        mask = self._get_missing_mask(X_arr)
-        valid_data = X_arr[~mask]
-
-        # If a non-numeric fill_value is provided with default strategy='mean',
-        # automatically switch to 'constant' to support string pipelines.
-        actual_strategy = self.strategy
-        if valid_data.size > 0 and valid_data.dtype.kind not in "biufc":
-            if actual_strategy in ["mean", "median"]:
-                if not isinstance(self.fill_value, (int, float, np.number)):
-                    actual_strategy = "constant"
-                else:
-                    raise ValueError(
-                        f"Cannot compute strategy='{actual_strategy}' on non-numeric string data."
-                    )
-
-        if actual_strategy == "constant" or (valid_data.size > 0 and valid_data.dtype.kind not in "biufc"):
-            self.statistics_ = self.fill_value
-        elif valid_data.size == 0:
-            self.statistics_ = float(self.fill_value)
-        else:
-            if actual_strategy == "mean":
-                self.statistics_ = float(np.mean(valid_data.astype(float)))
-            elif actual_strategy == "median":
-                self.statistics_ = float(np.median(valid_data.astype(float)))
-
+        mask = self._mask(arr)
+        stats = []
+        for column in range(arr.shape[1]):
+            values = arr[:, column][~mask[:, column]]
+            if self.strategy == "constant":
+                stats.append(self.fill_value)
+            elif values.size == 0:
+                stats.append(self.fill_value)
+            else:
+                try:
+                    numeric = values.astype(float)
+                    stats.append(float(np.mean(numeric)) if self.strategy == "mean" else float(np.median(numeric)))
+                except (TypeError, ValueError):
+                    if not isinstance(self.fill_value, (int, float, np.number)):
+                        stats.append(self.fill_value)
+                    else:
+                        raise ValueError(f"Cannot compute strategy='{self.strategy}' on non-numeric string data.")
+        self.statistics_ = np.asarray(stats, dtype=object)
+        self.n_features_in_ = arr.shape[1]
+        self._one_d = one_d
+        self._observed_values = [
+            arr[:, column][~mask[:, column]].tolist()
+            for column in range(arr.shape[1])
+        ]
         return self
 
-    def transform(self, X: npt.ArrayLike) -> npt.NDArray[Any]:
-        """
-        Replace missing values in the input 1D array with the learned statistic.
+    def partial_fit(self, X: npt.ArrayLike) -> "Imputer":
+        arr, one_d = _shape(X)
+        if arr.size == 0:
+            return self
+        if not hasattr(self, "n_features_in_"):
+            return self.fit(X)
+        if arr.shape[1] != self.n_features_in_:
+            raise ValueError("Imputer feature count changed.")
+        mask = self._mask(arr)
+        for column in range(arr.shape[1]):
+            values = arr[:, column][~mask[:, column]]
+            if values.size == 0 or self.strategy == "constant":
+                continue
+            try:
+                numeric = values.astype(float)
+                if self.strategy == "mean":
+                    old = getattr(self, "_observed_values", [[] for _ in range(arr.shape[1])])
+                    combined = old[column] + numeric.tolist()
+                    self._observed_values[column] = combined
+                    statistic = float(np.mean(combined))
+                else:
+                    old = getattr(self, "_observed_values", [[] for _ in range(arr.shape[1])])
+                    combined = old[column] + numeric.tolist()
+                    self._observed_values[column] = combined
+                    statistic = float(np.median(combined))
+                self.statistics_[column] = statistic
+            except (TypeError, ValueError):
+                pass
+        return self
 
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array containing missing values directly, shape (n_samples,).
+    def transform(self, X: npt.ArrayLike) -> np.ndarray:
+        if not hasattr(self, "statistics_"):
+            raise ValueError("Imputer is not fitted.")
+        arr, one_d = _shape(X)
+        if arr.shape[1] != self.n_features_in_:
+            raise ValueError("Imputer transform feature count mismatch.")
+        if arr.dtype.kind in "US":
+            arr = arr.astype(object)
+        result = arr.copy()
+        mask = self._mask(result)
+        for column in range(result.shape[1]):
+            result[mask[:, column], column] = self.statistics_[column]
+        return result.ravel() if one_d else result
 
-        Returns
-        -------
-        npt.NDArray[Any]
-            Imputed 1D array, shape (n_samples,).
-
-        Complexity
-        ----------
-        Time: O(n_samples)
-        Space: O(n_samples)
-        """
-        _check_is_fitted(self, ["statistics_"])
-        X_arr = _check_1d_array(X)
-
-        mask = self._get_missing_mask(X_arr)
-        return np.where(mask, self.statistics_, X_arr)
-
-    def fit_transform(self, X: npt.ArrayLike) -> npt.NDArray[Any]:
-        """
-        Fit to data, then transform it.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data with missing values, shape (n_samples,).
-
-        Returns
-        -------
-        npt.NDArray[Any]
-            Imputed 1D array, shape (n_samples,).
-        """
+    def fit_transform(self, X: npt.ArrayLike) -> np.ndarray:
         return self.fit(X).transform(X)
 
 
 class OneHotEncoder:
-    """
-    Encode a 1D categorical feature array into a 2D one-hot matrix.
-    Supports both non-negative integer categories (contiguous or non-contiguous)
-    and string categories using 100% vectorized NumPy operations.
-    """
-
-    categories_: int
-    unique_categories_: npt.NDArray[Any]
-    _category_type: str
+    def __init__(self, handle_unknown: str = "error") -> None:
+        if handle_unknown not in {"error", "ignore"}:
+            raise ValueError("handle_unknown must be error or ignore.")
+        self.handle_unknown = handle_unknown
 
     def fit(self, X: npt.ArrayLike) -> "OneHotEncoder":
-        """
-        Learn the sorted unique categories present in a 1D feature.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D categorical data array, shape (n_samples,).
-
-        Returns
-        -------
-        self : OneHotEncoder
-            The fitted encoder.
-
-        Complexity
-        ----------
-        Time: O(n_samples log n_samples)
-        Space: O(n_categories)
-        """
-        X_arr = _check_1d_array(X)
-        if X_arr.size == 0:
-            raise ValueError("OneHotEncoder requires at least one category.")
-
-        if np.issubdtype(X_arr.dtype, np.integer):
-            if np.any(X_arr < 0):
-                raise ValueError("Categories must be non-negative integers.")
-            self._category_type = "integer"
-        elif X_arr.dtype.kind in "USO":
-            self._category_type = "string"
-        else:
-            raise ValueError(
-                "OneHotEncoder expects integer categorical data or strings."
-            )
-
-        self.unique_categories_ = np.unique(X_arr)
-        self.categories_ = int(self.unique_categories_.size)
+        arr, one_d = _shape(X)
+        if arr.dtype.kind in "OUS":
+            arr = arr.astype(object)
+        if arr.size == 0:
+            raise ValueError("OneHotEncoder cannot fit empty data.")
+        categories = []
+        category_types = []
+        for column in range(arr.shape[1]):
+            values = arr[:, column]
+            kind = _category_kind(values)
+            categories.append(np.unique(values.astype(object)))
+            category_types.append(kind)
+        self.categories_ = categories
+        self.unique_categories_ = categories[0]
+        self.category_types_ = category_types
+        self.n_features_in_ = arr.shape[1]
+        self._one_d = one_d
         return self
 
-    def transform(self, X: npt.ArrayLike) -> npt.NDArray[np.floating[Any]]:
-        """
-        Transform the 1D data to a 2D one-hot encoded matrix using vectorized binary search.
+    def partial_fit(self, X: npt.ArrayLike) -> "OneHotEncoder":
+        arr, one_d = _shape(X)
+        if arr.dtype.kind in "OUS":
+            arr = arr.astype(object)
+        if arr.size == 0:
+            return self
+        if hasattr(self, "n_features_in_") and arr.shape[1] != self.n_features_in_:
+            raise ValueError("OneHotEncoder feature count changed.")
+        kinds = []
+        for column in range(arr.shape[1]):
+            kinds.append(_category_kind(arr[:, column]))
+        if hasattr(self, "category_types_") and any(old != new for old, new in zip(self.category_types_, kinds)):
+            raise ValueError(f"OneHotEncoder expects {self.category_types_[0]} categorical data.")
+        if not hasattr(self, "categories_"):
+            return self.fit(X)
+        for column in range(arr.shape[1]):
+            existing = self.categories_[column].tolist()
+            additions = [
+                value for value in arr[:, column].tolist()
+                if value not in existing
+            ]
+            self.categories_[column] = np.asarray(existing + additions, dtype=object)
+        self.unique_categories_ = self.categories_[0]
+        self.category_types_ = kinds
+        self.n_features_in_ = arr.shape[1]
+        return self
 
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D categorical data array, shape (n_samples,).
+    def transform(self, X: npt.ArrayLike) -> np.ndarray:
+        if not hasattr(self, "categories_"):
+            raise ValueError("OneHotEncoder is not fitted.")
+        arr, one_d = _shape(X)
+        if arr.shape[1] != self.n_features_in_:
+            raise ValueError("OneHotEncoder transform feature count mismatch.")
+        category_sets = self.categories_ if not one_d else [self.categories_] if isinstance(self.categories_, np.ndarray) else self.categories_
+        if not isinstance(category_sets, list):
+            category_sets = [category_sets]
+        blocks = []
+        for column, categories in enumerate(category_sets):
+            expected_kind = self.category_types_[column]
+            for value in arr[:, column]:
+                kind = _category_kind(np.asarray([value], dtype=object))
+                if kind != expected_kind:
+                    raise ValueError(f"OneHotEncoder expects {expected_kind} categorical data.")
+            block = np.zeros((arr.shape[0], len(categories)), dtype=float)
+            for row, value in enumerate(arr[:, column]):
+                matches = np.flatnonzero(np.asarray(categories) == value)
+                if matches.size:
+                    block[row, int(matches[0])] = 1.0
+                elif self.handle_unknown == "error":
+                    raise ValueError(f"Unknown category {value!r}; unknown categories are not allowed.")
+            blocks.append(block)
+        return np.concatenate(blocks, axis=1)
 
-        Returns
-        -------
-        npt.NDArray[np.floating[Any]]
-            One-hot encoded 2D array, shape (n_samples, n_categories).
+    def fit_transform(self, X: npt.ArrayLike) -> np.ndarray:
+        return self.fit(X).transform(X)
 
-        Raises
-        ------
-        ValueError
-            If unseen categories or mismatched data types are encountered.
 
-        Complexity
-        ----------
-        Time: O(n_samples log n_categories + n_samples * n_categories)
-        Space: O(n_samples * n_categories)
-        """
-        _check_is_fitted(self, ["categories_", "unique_categories_", "_category_type"])
-        X_arr = _check_1d_array(X)
+class ColumnSelector:
+    def __init__(self, columns: npt.ArrayLike | str, feature_names: npt.ArrayLike | None = None) -> None:
+        self.columns, self.feature_names = columns, feature_names
 
-        if self._category_type == "integer" and not np.issubdtype(X_arr.dtype, np.integer):
-            raise ValueError("OneHotEncoder expects integer categorical data.")
-        if self._category_type == "string" and X_arr.dtype.kind not in "USO":
-            raise ValueError("OneHotEncoder expects string categorical data.")
+    def fit(self, X: npt.ArrayLike) -> "ColumnSelector":
+        arr = np.asarray(X)
+        if arr.ndim != 2:
+            raise ValueError("ColumnSelector requires a two-dimensional array.")
+        if self.feature_names is not None and len(self.feature_names) != arr.shape[1]:
+            raise ValueError("feature_names length must match input feature count.")
+        if isinstance(self.columns, str):
+            if self.columns == "numeric":
+                selected = [
+                    index for index in range(arr.shape[1])
+                    if all(
+                        isinstance(value, (int, float, np.integer, np.floating))
+                        and not isinstance(value, (bool, np.bool_))
+                        for value in arr[:, index].tolist()
+                    )
+                ]
+            elif self.columns == "categorical":
+                numeric = {
+                    index for index in range(arr.shape[1])
+                    if all(
+                        isinstance(value, (int, float, np.integer, np.floating))
+                        and not isinstance(value, (bool, np.bool_))
+                        for value in arr[:, index].tolist()
+                    )
+                }
+                selected = [index for index in range(arr.shape[1]) if index not in numeric]
+            else:
+                raise ValueError("Invalid selected columns.")
+        else:
+            selected = list(np.asarray(self.columns).ravel())
+            if self.feature_names is not None:
+                names = {name: index for index, name in enumerate(self.feature_names)}
+                selected = [names.get(column, column) for column in selected]
+            selected = [int(column) for column in selected]
+        if any(column < 0 or column >= arr.shape[1] for column in selected):
+            raise ValueError("Invalid selected columns.")
+        self.selected_ = np.asarray(selected, dtype=int)
+        self.n_features_in_ = arr.shape[1]
+        return self
 
-        if X_arr.size == 0:
-            return np.empty((0, self.categories_), dtype=float)
+    def transform(self, X: npt.ArrayLike) -> np.ndarray:
+        arr = np.asarray(X)
+        if not hasattr(self, "selected_"):
+            raise ValueError("ColumnSelector is not fitted.")
+        if arr.ndim != 2:
+            raise ValueError("ColumnSelector requires a two-dimensional array.")
+        if arr.shape[1] != self.n_features_in_:
+            raise ValueError("ColumnSelector input feature count changed.")
+        return arr[:, self.selected_]
 
-        # Vectorized binary search maps each category to its column index without Python loops
-        indices = np.searchsorted(self.unique_categories_, X_arr)
-
-        # Clip indices to safely verify exact match against learned unique_categories_
-        safe_indices = np.clip(indices, 0, self.categories_ - 1)
-        unknown_mask = (
-            (indices < 0)
-            | (indices >= self.categories_)
-            | (self.unique_categories_[safe_indices] != X_arr)
-        )
-        if np.any(unknown_mask):
-            raise ValueError("Found unknown categories during transform.")
-
-        # Allocate only the output matrix and set 1.0 at each sample's category column
-        encoded = np.zeros((X_arr.size, self.categories_), dtype=float)
-        encoded[np.arange(X_arr.size), indices] = 1.0
-        return encoded
-
-    def fit_transform(self, X: npt.ArrayLike) -> npt.NDArray[np.floating[Any]]:
-        """
-        Fit to data, then transform it.
-
-        Parameters
-        ----------
-        X : npt.ArrayLike
-            Input 1D data array, shape (n_samples,).
-
-        Returns
-        -------
-        npt.NDArray[np.floating[Any]]
-            Scaled 1D array, shape (n_samples,).
-        """
+    def fit_transform(self, X: npt.ArrayLike) -> np.ndarray:
         return self.fit(X).transform(X)

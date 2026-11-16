@@ -69,6 +69,21 @@ def _validate_data(
     return arr
 
 
+def _stable_mean(arr: NDArray[np.float64]) -> float:
+    scale = float(np.max(np.abs(arr)))
+    if scale == 0.0:
+        return 0.0
+    return float(np.mean(arr / scale) * scale)
+
+
+def _stable_variance(arr: NDArray[np.float64]) -> float:
+    scale = float(np.max(np.abs(arr)))
+    if scale == 0.0:
+        return 0.0
+    centered = arr / scale - _stable_mean(arr) / scale
+    return float(np.mean(centered * centered) * scale * scale)
+
+
 def mean(
     data: npt.ArrayLike,
     axis: int | tuple[int, ...] | None = None,
@@ -440,3 +455,136 @@ def histogram(
     )
 
     return counts, edges
+
+
+def variance(data: npt.ArrayLike) -> float:
+    arr = _as_numeric_array(data)
+    if arr.size == 0:
+        raise ValueError("Data must not be empty")
+    return float(np.var(arr))
+
+
+def update_stats(values: npt.ArrayLike, state: dict[str, object] | None = None, window: int | None = None) -> dict[str, object]:
+    arr = _as_numeric_array(values).ravel()
+    if arr.size == 0:
+        raise ValueError("Data must not be empty")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Data must contain finite values")
+
+    if state is None:
+        state = {"count": 0, "mean": 0.0, "variance": 0.0, "min": float("inf"), "max": float("-inf")}
+    combined_window = list(state.get("window", [])) if window is not None else None
+    if combined_window is not None:
+        combined_window.extend(arr.tolist())
+        combined_window = combined_window[-window:]
+        arr_window = np.asarray(combined_window, dtype=float)
+        state["window"] = combined_window
+        state["count"] = int(arr_window.size)
+        state["mean"] = _stable_mean(arr_window)
+        state["variance"] = _stable_variance(arr_window)
+        state["min"] = float(np.min(arr_window))
+        state["max"] = float(np.max(arr_window))
+        return state
+
+    count = int(state["count"])
+    mean = float(state["mean"])
+    old_m2 = float(state["variance"]) * count
+    new_count = count + arr.size
+    batch_mean = _stable_mean(arr)
+    batch_m2 = float(np.dot(arr - batch_mean, arr - batch_mean))
+    if count == 0:
+        new_mean = batch_mean
+        new_m2 = batch_m2
+    else:
+        delta = batch_mean - mean
+        new_mean = mean * (count / new_count) + batch_mean * (arr.size / new_count)
+        new_m2 = old_m2 + batch_m2 + delta * delta * count * arr.size / new_count
+    state.update(
+        count=new_count,
+        mean=new_mean,
+        variance=new_m2 / new_count,
+        min=min(float(state["min"]), float(np.min(arr))),
+        max=max(float(state["max"]), float(np.max(arr))),
+    )
+    return state
+
+
+class StreamingStats:
+    def __init__(self, window: int | None = None) -> None:
+        self.window = window
+        self.reset()
+
+    def reset(self) -> None:
+        self._values = []
+
+    def update(self, values: npt.ArrayLike) -> "StreamingStats":
+        arr = _as_numeric_array(values).ravel()
+        if arr.size == 0:
+            raise ValueError("StreamingStats update cannot be empty.")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("StreamingStats values must contain finite values.")
+        self._values.extend(arr.tolist())
+        if self.window is not None:
+            self._values = self._values[-self.window:]
+        return self
+
+    def result(self) -> dict[str, object]:
+        arr = np.asarray(self._values, dtype=float)
+        if arr.size == 0:
+            return {"count": 0, "mean": 0.0, "variance": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "count": int(arr.size),
+            "mean": _stable_mean(arr),
+            "variance": _stable_variance(arr),
+            "std": float(np.sqrt(_stable_variance(arr))),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+
+    def quantile(self, q: float) -> float:
+        if not self._values:
+            raise ValueError("No observations.")
+        return float(np.quantile(np.asarray(self._values), q))
+
+
+class StreamingHistogram:
+    def __init__(self, bins: int = 10, window: int | None = None) -> None:
+        if isinstance(bins, bool) or not isinstance(bins, (int, np.integer)) or bins <= 0:
+            raise ValueError("bins must be a positive integer.")
+        self.bins = int(bins)
+        self.window = window
+        self.reset()
+
+    def reset(self) -> None:
+        self._values = []
+
+    def update(self, values: npt.ArrayLike) -> "StreamingHistogram":
+        arr = _as_numeric_array(values).ravel()
+        if arr.size == 0:
+            raise ValueError("StreamingHistogram update cannot be empty.")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("StreamingHistogram values must contain finite values.")
+        self._values.extend(arr.tolist())
+        if self.window is not None:
+            self._values = self._values[-self.window:]
+        return self
+
+    def result(self) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+        if not self._values:
+            raise ValueError("No observations.")
+        low = float(np.min(self._values))
+        high = float(np.max(self._values))
+        if low == high:
+            low -= 0.5
+            high += 0.5
+        scale = max(abs(low), abs(high), 1.0)
+        normalized = np.asarray(self._values, dtype=float) / scale
+        counts, edges = np.histogram(
+            normalized,
+            bins=self.bins,
+            range=(low / scale, high / scale),
+        )
+        edge_values = edges * scale
+        edge_values[0] = low
+        edge_values[-1] = high
+        return counts, edge_values

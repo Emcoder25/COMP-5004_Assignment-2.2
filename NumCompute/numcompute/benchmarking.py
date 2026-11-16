@@ -3,6 +3,7 @@
 import argparse
 from collections.abc import Callable
 from collections.abc import Sequence
+from collections.abc import Iterable
 import os
 import platform
 from statistics import median
@@ -63,19 +64,27 @@ def benchmark(
     ):
         raise ValueError("repeats must be positive and warmup must be non-negative.")
     # Warm-up runs are useful to the function but should not affect its timings.
+    lazy_iterators_consumed = False
     for _ in range(warmup):
-        function(*args, **kwargs)
+        result = function(*args, **kwargs)
+        if isinstance(result, Iterable) and not isinstance(result, (str, bytes, np.ndarray)):
+            list(result)
+            lazy_iterators_consumed = True
     timings: list[float] = []
     for _ in range(repeats):
         # perf_counter is intended for measuring short durations.
         started = perf_counter()
-        function(*args, **kwargs)
+        result = function(*args, **kwargs)
+        if isinstance(result, Iterable) and not isinstance(result, (str, bytes, np.ndarray)):
+            list(result)
+            lazy_iterators_consumed = True
         timings.append(perf_counter() - started)
     return {
         "repeats": repeats,
         "minimum_seconds": min(timings),
         "median_seconds": median(timings),
         "mean_seconds": sum(timings) / len(timings),
+        "lazy_iterators_consumed": lazy_iterators_consumed,
         "environment": {
             "python": platform.python_version(),
             "numpy": np.__version__,
@@ -111,6 +120,29 @@ def compare(
         name: benchmark(function, *args, repeats=repeats, warmup=warmup, **kwargs)
         for name, function in functions.items()
     }
+
+
+def compare_implementations(
+    functions: dict[str, Callable[..., object]],
+    *args: object,
+    reference: str | None = None,
+    repeats: int = 5,
+    warmup: int = 1,
+    **kwargs: object,
+) -> dict[str, dict[str, object]]:
+    if not functions:
+        raise ValueError("functions must contain at least one implementation.")
+    reference_name = reference or next(iter(functions))
+    if reference_name not in functions:
+        raise ValueError("reference implementation must be present.")
+    reference_output = np.asarray(functions[reference_name](*args, **kwargs))
+    for name, function in functions.items():
+        output = np.asarray(function(*args, **kwargs))
+        try:
+            np.testing.assert_allclose(output, reference_output)
+        except (AssertionError, TypeError, ValueError) as error:
+            raise ValueError("implementation output does not match the reference output.") from error
+    return compare(functions, *args, repeats=repeats, warmup=warmup, **kwargs)
 
 
 def format_table(results: dict[str, dict[str, object]]) -> str:
