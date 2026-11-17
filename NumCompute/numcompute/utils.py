@@ -15,6 +15,8 @@ def euclidean_distance(a: npt.ArrayLike, b: npt.ArrayLike) -> float:
     left, right = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
     if left.shape != right.shape:
         raise ValueError("a and b must have the same shape.")
+    if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+        raise ValueError("distance inputs must contain finite values.")
     return float(np.linalg.norm(left - right))
 
 
@@ -27,6 +29,8 @@ def manhattan_distance(a: npt.ArrayLike, b: npt.ArrayLike) -> float:
     left, right = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
     if left.shape != right.shape:
         raise ValueError("a and b must have the same shape.")
+    if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+        raise ValueError("distance inputs must contain finite values.")
     return float(np.sum(np.abs(left - right)))
 
 
@@ -182,3 +186,30 @@ def batches(data: npt.ArrayLike, batch_size: int) -> Iterator[npt.NDArray[np.gen
     # Slicing returns views and naturally includes a shorter final batch.
     for start in range(0, len(values), batch_size):
         yield values[start : start + batch_size]
+
+
+def positive_int(value: object, name: str = "value") -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise TypeError(f"{name} must be a positive integer.")
+    return int(value)
+
+
+def deep_sizeof(value: object) -> int:
+    seen: set[int] = set()
+
+    def size(obj: object) -> int:
+        obj_id = id(obj)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+        if isinstance(obj, np.ndarray):
+            return int(obj.nbytes)
+        if isinstance(obj, dict):
+            return sum(size(key) + size(item) for key, item in obj.items())
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return sum(size(item) for item in obj)
+        if hasattr(obj, "__dict__"):
+            return sum(size(item) for item in vars(obj).values())
+        return int(np.dtype(object).itemsize)
+
+    return size(value)

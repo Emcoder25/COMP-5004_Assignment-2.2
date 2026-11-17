@@ -8,7 +8,27 @@ from typing import Any, Iterable
 import numpy as np
 
 from ._validation import supervised_chunk
-from .utils import deep_sizeof
+
+
+def _deep_sizeof(value: Any) -> int:
+    seen: set[int] = set()
+
+    def size(obj: object) -> int:
+        obj_id = id(obj)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+        if isinstance(obj, np.ndarray):
+            return int(obj.nbytes)
+        if isinstance(obj, dict):
+            return sum(size(key) + size(item) for key, item in obj.items())
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return sum(size(item) for item in obj)
+        if hasattr(obj, "__dict__"):
+            return sum(size(item) for item in vars(obj).values())
+        return np.dtype(object).itemsize
+
+    return size(value)
 
 
 class StreamTrainer:
@@ -90,7 +110,7 @@ class StreamTrainer:
             else:
                 metric.update(targets, predictions)
             row[name] = metric.result()
-        row["memory_bytes"] = deep_sizeof(self.model) if self.track_memory else None
+        row["memory_bytes"] = _deep_sizeof(self.model) if self.track_memory else None
         self.logs.append(row)
         return float(row["accuracy"])
 
@@ -111,7 +131,7 @@ class StreamTrainer:
                         "accuracy": None,
                         "cumulative_accuracy": self._total_correct / self._total_samples if self._total_samples else None,
                         "score_seconds": 0.0,
-                        "memory_bytes": deep_sizeof(self.model) if self.track_memory else None,
+                        "memory_bytes": _deep_sizeof(self.model) if self.track_memory else None,
                     }
                 )
         return self.get_logs()
