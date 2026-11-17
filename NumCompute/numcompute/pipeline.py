@@ -63,6 +63,17 @@ class Compose:
         self._fit_transform(X)
         return self
 
+    def partial_fit(self, X: npt.ArrayLike, y: npt.ArrayLike | None = None) -> "Compose":
+        """Apply incremental updates where supported, refitting otherwise."""
+        current = X
+        for _, transformer in self.steps:
+            if hasattr(transformer, "partial_fit"):
+                transformer.partial_fit(current)
+            else:
+                transformer.fit(current)
+            current = transformer.transform(current)
+        return self
+
     def transform(self, X: npt.ArrayLike) -> npt.ArrayLike:
         """Apply each fitted transformer in sequence."""
         current = X
@@ -355,3 +366,12 @@ class Pipeline:
         if not hasattr(final, "predict"):
             raise AttributeError("the final pipeline step does not implement predict.")
         return cast(Estimator, final).predict(self.transform(X))
+
+    def predict_proba(self, X: npt.ArrayLike) -> npt.ArrayLike:
+        """Transform X and return class probabilities from the final estimator."""
+        if not self._is_fitted:
+            raise RuntimeError("Pipeline must be fitted before predict_proba.")
+        final = self.steps[-1][1]
+        if not hasattr(final, "predict_proba"):
+            raise AttributeError("the final pipeline step does not implement predict_proba.")
+        return final.predict_proba(self.transform(X))

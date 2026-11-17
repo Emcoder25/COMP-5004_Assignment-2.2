@@ -2,6 +2,8 @@ import numpy as np
 import numpy.typing as npt
 from numpy.typing import NDArray
 
+_ZERO_DIVISION_UNSET = object()
+
 
 def _validate_labels(
     y_true: npt.ArrayLike,
@@ -34,14 +36,14 @@ def _validate_labels(
     true = np.asarray(y_true)
     pred = np.asarray(y_pred)
 
+    if true.shape != pred.shape:
+        raise ValueError("y_true and y_pred must have the same shapes")
+
     if true.ndim != 1 or pred.ndim != 1:
         raise ValueError("y_true and y_pred must be 1D arrays")
 
     if true.size == 0 or pred.size == 0:
         raise ValueError("y_true and y_pred must not be empty")
-
-    if true.shape != pred.shape:
-        raise ValueError("y_true and y_pred must have the same shape")
 
     if true.dtype.kind in "fc" and not np.all(np.isfinite(true)):
         raise ValueError("y_true must not contain NaN or infinity")
@@ -81,8 +83,10 @@ def _safe_divide(
 
     Complexity: O(1) time and O(1) space.
     """
-    if zero_division not in (0, 1):
-        raise ValueError("zero_division must be 0 or 1")
+    if zero_division is _ZERO_DIVISION_UNSET:
+        zero_division = 0
+    if not isinstance(zero_division, (int, float, np.number)):
+        raise ValueError("zero_division must be numeric")
 
     if denominator == 0:
         return float(zero_division)
@@ -118,6 +122,7 @@ def accuracy(
     Complexity: O(n) time for n predictions.
     """
     true, pred = _validate_labels(y_true, y_pred)
+
     return float(np.mean(true == pred))
 
 
@@ -169,6 +174,10 @@ def confusion_matrix(
         if np.unique(labels).size != labels.size:
             raise ValueError("labels must not contain duplicates")
 
+    observed = np.unique(np.concatenate((true, pred)))
+    if labels.size and any(label not in labels for label in observed):
+        raise ValueError("labels must include every observed class.")
+
     label_to_index = {
         label: i for i, label in enumerate(labels.tolist())
     }
@@ -195,42 +204,30 @@ def precision(
     y_true: npt.ArrayLike,
     y_pred: npt.ArrayLike,
     positive_label: object = 1,
-    zero_division: int = 0,
+    average: str | None = None,
+    zero_division: object = _ZERO_DIVISION_UNSET,
 ) -> float:
-    """Calculate binary precision for the selected positive class.
-
-    Parameters
-    ----------
-    y_true : array-like
-        Actual class labels.
-    y_pred : array-like
-        Predicted class labels.
-    positive_label : object, default=1
-        Label treated as the positive class.
-    zero_division : int, default=0
-        Value returned when there are no predicted positive samples.
-        Must be 0 or 1.
-
-    Returns
-    -------
-    float
-        Precision value: True positives divided by the sum of true and false positives.
-
-    Raises
-    ------
-    ValueError
-        If the labels are invalid or zero_division is not 0 or 1.
-
-    Complexity: O(n) time for n samples.
-    """
     true, pred = _validate_labels(y_true, y_pred)
-
+    if average is not None:
+        if average not in {"micro", "macro", "weighted"}:
+            raise ValueError("average must be micro, macro, or weighted.")
+        labels = np.unique(np.concatenate((true, pred)))
+        if average == "micro":
+            return float(np.mean(true == pred))
+        fallback = 0 if zero_division is _ZERO_DIVISION_UNSET else zero_division
+        values = [precision(true, pred, positive_label=label, zero_division=fallback) for label in labels]
+        if average == "weighted":
+            weights = [np.count_nonzero(true == label) for label in labels]
+            return float(np.average(values, weights=weights))
+        return float(np.mean(values))
+    if not np.any(true == positive_label):
+        if zero_division is _ZERO_DIVISION_UNSET:
+            raise ValueError("positive_label must be present in y_true.")
+        return float(zero_division)
     actual_positive = true == positive_label
     predicted_positive = pred == positive_label
-
     tp = np.count_nonzero(actual_positive & predicted_positive)
     fp = np.count_nonzero(~actual_positive & predicted_positive)
-
     return _safe_divide(tp, tp + fp, zero_division)
 
 
@@ -238,37 +235,26 @@ def recall(
     y_true: npt.ArrayLike,
     y_pred: npt.ArrayLike,
     positive_label: object = 1,
-    zero_division: int = 0,
+    average: str | None = None,
+    zero_division: object = _ZERO_DIVISION_UNSET,
 ) -> float:
-    """Calculate binary recall for the selected positive class.
-
-    Parameters
-    ----------
-    y_true : array-like
-        Actual class labels.
-    y_pred : array-like
-        Predicted class labels.
-    positive_label : object, default=1
-        Label treated as the positive class.
-    zero_division : int, default=0
-        Value returned when there are no actual positive samples.
-        Must be 0 or 1.
-
-    Returns
-    -------
-    float
-        Recall value: True positives divided by the sum of true positives and
-        false negatives.
-
-    Raises
-    ------
-    ValueError
-        If the labels are invalid or zero_division is not 0 or 1.
-
-    Complexity: O(n) time for n samples.
-    """
     true, pred = _validate_labels(y_true, y_pred)
-
+    if average is not None:
+        if average not in {"micro", "macro", "weighted"}:
+            raise ValueError("average must be micro, macro, or weighted.")
+        labels = np.unique(np.concatenate((true, pred)))
+        if average == "micro":
+            return float(np.mean(true == pred))
+        fallback = 0 if zero_division is _ZERO_DIVISION_UNSET else zero_division
+        values = [recall(true, pred, positive_label=label, zero_division=fallback) for label in labels]
+        if average == "weighted":
+            weights = [np.count_nonzero(true == label) for label in labels]
+            return float(np.average(values, weights=weights))
+        return float(np.mean(values))
+    if not np.any(true == positive_label):
+        if zero_division is _ZERO_DIVISION_UNSET:
+            raise ValueError("positive_label must be present in y_true.")
+        return float(zero_division)
     actual_positive = true == positive_label
     predicted_positive = pred == positive_label
 
@@ -282,35 +268,26 @@ def f1(
     y_true: npt.ArrayLike,
     y_pred: npt.ArrayLike,
     positive_label: object = 1,
-    zero_division: int = 0,
+    average: str | None = None,
+    zero_division: object = _ZERO_DIVISION_UNSET,
 ) -> float:
-    """
-    Calculate the binary F1 score.
-
-    Parameters
-    ----------
-    y_true : array-like
-        Actual class labels.
-    y_pred : array-like
-        Predicted class labels.
-    positive_label : object, default=1
-        Label treated as the positive class.
-    zero_division : int, default=0
-        Value returned when a division denominator is zero.
-        Must be 0 or 1.
-
-    Returns
-    -------
-    float
-        Harmonic mean of precision and recall.
-
-    Raises
-    ------
-    ValueError
-        If the labels are invalid or zero_division is not 0 or 1.
-
-    Complexity: O(n) time for n samples.
-    """
+    true, pred = _validate_labels(y_true, y_pred)
+    if average is not None:
+        if average not in {"micro", "macro", "weighted"}:
+            raise ValueError("average must be micro, macro, or weighted.")
+        labels = np.unique(np.concatenate((true, pred)))
+        if average == "micro":
+            return float(np.mean(true == pred))
+        fallback = 0 if zero_division is _ZERO_DIVISION_UNSET else zero_division
+        values = [f1(true, pred, positive_label=label, zero_division=fallback) for label in labels]
+        if average == "weighted":
+            weights = [np.count_nonzero(true == label) for label in labels]
+            return float(np.average(values, weights=weights))
+        return float(np.mean(values))
+    if not np.any(true == positive_label):
+        if zero_division is _ZERO_DIVISION_UNSET:
+            raise ValueError("positive_label must be present in y_true.")
+        return float(zero_division)
     p = precision(
         y_true,
         y_pred,
@@ -431,7 +408,7 @@ def roc_curve(
     scores = scores.astype(float, copy=False)
 
     if not np.all(np.isfinite(scores)):
-        raise ValueError("y_score must not contain NaN or infinity")
+        raise ValueError("y_score must not contain NaN or infinity; finite values are required")
 
     if true.dtype.kind in "fc" and not np.all(np.isfinite(true)):
         raise ValueError("y_true must not contain NaN or infinity")
@@ -575,3 +552,158 @@ def roc_auc_score(
     )
 
     return auc(fpr, tpr)
+
+
+class Accuracy:
+    def __init__(self, window: int | None = None) -> None:
+        self.window = window
+        self.reset()
+
+    def reset(self) -> None:
+        self._true = []
+        self._pred = []
+
+    def update(self, y_true: npt.ArrayLike, y_pred: npt.ArrayLike) -> "Accuracy":
+        true, pred = _validate_labels(y_true, y_pred)
+        self._true.extend(true.tolist())
+        self._pred.extend(pred.tolist())
+        if self.window is not None:
+            self._true = self._true[-self.window:]
+            self._pred = self._pred[-self.window:]
+        return self
+
+    def result(self) -> float:
+        return accuracy(self._true, self._pred) if self._true else 0.0
+
+
+class ConfusionMatrix:
+    def __init__(self, labels: npt.ArrayLike | None = None, window: int | None = None) -> None:
+        self.labels = None if labels is None else np.asarray(labels)
+        self.window = window
+        self.reset()
+
+    def reset(self) -> None:
+        self._true = []
+        self._pred = []
+
+    def update(self, y_true: npt.ArrayLike, y_pred: npt.ArrayLike) -> "ConfusionMatrix":
+        true, pred = _validate_labels(y_true, y_pred)
+        self._true.extend(true.tolist())
+        self._pred.extend(pred.tolist())
+        if self.window is not None:
+            self._true = self._true[-self.window:]
+            self._pred = self._pred[-self.window:]
+        return self
+
+    def result(self) -> NDArray[np.int64]:
+        if not self._true:
+            size = 0 if self.labels is None else len(self.labels)
+            return np.zeros((size, size), dtype=np.int64)
+        return confusion_matrix(self._true, self._pred, labels=self.labels)
+
+
+class _StreamingMetric:
+    def __init__(self, average: str = "binary", window: int | None = None, positive_label: object = 1) -> None:
+        self.average = average
+        self.window = window
+        self.positive_label = positive_label
+        self.reset()
+
+    def reset(self) -> None:
+        self._true = []
+        self._pred = []
+
+    def update(self, y_true: npt.ArrayLike, y_pred: npt.ArrayLike) -> "_StreamingMetric":
+        true, pred = _validate_labels(y_true, y_pred)
+        self._true.extend(true.tolist())
+        self._pred.extend(pred.tolist())
+        if self.window is not None:
+            self._true = self._true[-self.window:]
+            self._pred = self._pred[-self.window:]
+        return self
+
+    def _values(self) -> tuple[np.ndarray, np.ndarray]:
+        return np.asarray(self._true), np.asarray(self._pred)
+
+
+class Precision(_StreamingMetric):
+    def result(self) -> float:
+        if not self._true:
+            return 0.0
+        true, pred = self._values()
+        if self.average in ("binary", "default"):
+            return precision(true, pred, positive_label=self.positive_label)
+        labels = np.unique(np.concatenate((true, pred)))
+        values = [precision(true, pred, positive_label=label, zero_division=0) for label in labels]
+        if self.average == "weighted":
+            weights = [np.count_nonzero(true == label) for label in labels]
+            return float(np.average(values, weights=weights))
+        return float(np.mean(values))
+
+
+class Recall(_StreamingMetric):
+    def result(self) -> float:
+        if not self._true:
+            return 0.0
+        true, pred = self._values()
+        if self.average in ("binary", "default"):
+            return recall(true, pred, positive_label=self.positive_label)
+        labels = np.unique(np.concatenate((true, pred)))
+        values = [recall(true, pred, positive_label=label, zero_division=0) for label in labels]
+        if self.average == "weighted":
+            weights = [np.count_nonzero(true == label) for label in labels]
+            return float(np.average(values, weights=weights))
+        return float(np.mean(values))
+
+
+class F1Score(_StreamingMetric):
+    def result(self) -> float:
+        if not self._true:
+            return 0.0
+        true, pred = self._values()
+        if self.average in ("binary", "default"):
+            return f1(true, pred, positive_label=self.positive_label)
+        labels = np.unique(np.concatenate((true, pred)))
+        values = [f1(true, pred, positive_label=label, zero_division=0) for label in labels]
+        if self.average == "weighted":
+            weights = [np.count_nonzero(true == label) for label in labels]
+            return float(np.average(values, weights=weights))
+        return float(np.mean(values))
+
+
+class AUC:
+    def __init__(self, n_bins: int = 100, positive_label: object = 1) -> None:
+        self.n_bins = n_bins
+        self.positive_label = positive_label
+        self.reset()
+
+    def reset(self) -> None:
+        self._true = []
+        self._scores = []
+
+    def update(self, y_true: npt.ArrayLike, y_score: npt.ArrayLike) -> "AUC":
+        true = np.asarray(y_true)
+        scores = np.asarray(y_score)
+        if true.ndim != 1 or scores.ndim != 1 or true.shape != scores.shape:
+            raise ValueError("y_true and y_score must have the same shapes.")
+        if scores.dtype.kind not in "iuf" or not np.all(np.isfinite(scores)):
+            raise ValueError("y_score must contain finite values.")
+        if np.any((scores < 0) | (scores > 1)):
+            raise ValueError("y_score must be in [0, 1].")
+        self._true.extend(true.tolist())
+        self._scores.extend(scores.astype(float).tolist())
+        return self
+
+    def result(self) -> float:
+        true = np.asarray(self._true)
+        scores = np.asarray(self._scores)
+        positive = true == self.positive_label
+        if not np.any(positive) or np.any(~positive):
+            pass
+        if not np.any(positive) or np.all(positive):
+            raise ValueError("AUC requires at least one positive and one negative label.")
+        negatives = scores[~positive]
+        positives = scores[positive]
+        greater = positives[:, None] > negatives[None, :]
+        ties = positives[:, None] == negatives[None, :]
+        return float((np.count_nonzero(greater) + 0.5 * np.count_nonzero(ties)) / (positives.size * negatives.size))

@@ -146,3 +146,82 @@ class Ranker:
                 return arr[lower]
             weight = pos - lower
             return arr[lower] * (1 - weight) + arr[upper] * weight
+
+
+class StreamingTopK:
+    def __init__(self, k: int, largest: bool = True) -> None:
+        if isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer)) or k <= 0:
+            raise TypeError("k must be a positive integer.")
+        self.k = int(k)
+        self.largest = bool(largest)
+        self.reset()
+
+    def reset(self) -> None:
+        self._chunks = []
+
+    def update(self, values) -> "StreamingTopK":
+        arr = np.asarray(values)
+        if arr.ndim != 1:
+            raise TypeError("StreamingTopK values must be 1D.")
+        if arr.dtype.kind not in "iuf" or not np.all(np.isfinite(arr)):
+            raise ValueError("StreamingTopK values must be finite.")
+        self._chunks.append(arr)
+        return self
+
+    def result(self):
+        if not self._chunks:
+            return np.array([]), np.array([], dtype=int)
+        values = np.concatenate(self._chunks)
+        order = np.argsort(-values, kind="stable") if self.largest else np.argsort(values, kind="stable")
+        order = order[:self.k]
+        return values[order], order
+
+
+class StreamingRanker:
+    def __init__(self, method: str = "average") -> None:
+        if method not in {"average", "dense", "ordinal"}:
+            raise ValueError("Invalid ranking method.")
+        self.method = method
+        self._values = []
+
+    def update(self, values) -> "StreamingRanker":
+        arr = np.asarray(values)
+        if arr.size == 0:
+            raise ValueError("No values.")
+        if arr.dtype.kind not in "iuf" or not np.all(np.isfinite(arr)):
+            raise ValueError("StreamingRanker values must be finite.")
+        self._values.extend(arr.ravel().tolist())
+        return self
+
+    def result(self):
+        arr = np.asarray(self._values)
+        if arr.size == 0:
+            raise ValueError("No values.")
+        if self.method == "ordinal":
+            order = np.argsort(arr, kind="stable")
+            ranks = np.empty(arr.size)
+            ranks[order] = np.arange(1, arr.size + 1)
+            return ranks
+        unique, inverse, counts = np.unique(arr, return_inverse=True, return_counts=True)
+        if self.method == "dense":
+            return (inverse + 1).astype(float)
+        starts = np.cumsum(counts) - counts
+        return starts[inverse] + (counts[inverse] + 1) / 2.0
+
+
+def rank(values) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError("values must be 1D.")
+    unique, inverse, counts = np.unique(arr, return_inverse=True, return_counts=True)
+    starts = np.cumsum(counts) - counts
+    return starts[inverse] + (counts[inverse] + 1) / 2.0
+
+
+def percentile(values, q: float) -> float:
+    arr = np.asarray(values)
+    if arr.size == 0:
+        raise ValueError("No values.")
+    if not np.isfinite(q) or q < 0 or q > 100:
+        raise ValueError("q must be between 0 and 100.")
+    return float(np.percentile(arr, q))
