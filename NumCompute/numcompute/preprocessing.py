@@ -25,6 +25,18 @@ def _stable_mean(arr: np.ndarray) -> np.ndarray:
     return np.mean(arr / scale, axis=0) * scale
 
 
+def _real_numeric_array(arr: np.ndarray, name: str) -> np.ndarray:
+    if arr.dtype.kind in "iuf":
+        return arr.astype(float, copy=False)
+    if arr.dtype.kind == "O" and all(
+        isinstance(value, (int, float, np.integer, np.floating))
+        and not isinstance(value, (bool, np.bool_))
+        for value in arr.flat
+    ):
+        return arr.astype(float)
+    raise TypeError(f"{name} requires real numeric values.")
+
+
 def _category_kind(values: np.ndarray) -> str:
     items = values.tolist()
     if any(value is None for value in items):
@@ -57,9 +69,7 @@ class StandardScaler:
         arr, one_d = _shape(X)
         if arr.size == 0:
             raise ValueError("StandardScaler cannot fit on an empty array.")
-        if arr.dtype.kind not in "iuf" or np.issubdtype(arr.dtype, np.bool_):
-            raise TypeError("StandardScaler requires real numeric values.")
-        arr = arr.astype(float)
+        arr = _real_numeric_array(arr, "StandardScaler")
         if not np.all(np.isfinite(arr)):
             raise ValueError("StandardScaler values must be finite.")
         means = _stable_mean(arr)
@@ -81,9 +91,7 @@ class StandardScaler:
             if hasattr(self, "mean_"):
                 return self
             raise ValueError("StandardScaler cannot fit on an empty array.")
-        if arr.dtype.kind not in "iuf" or np.issubdtype(arr.dtype, np.bool_):
-            raise TypeError("StandardScaler requires real numeric values.")
-        arr = arr.astype(float)
+        arr = _real_numeric_array(arr, "StandardScaler")
         if not np.all(np.isfinite(arr)):
             raise ValueError("StandardScaler values must be finite.")
         if hasattr(self, "n_features_in_") and arr.shape[1] != self.n_features_in_:
@@ -128,13 +136,9 @@ class StandardScaler:
         if not hasattr(self, "mean_"):
             raise ValueError("This StandardScaler instance is not fitted yet.")
         arr, one_d = _shape(X)
-        if arr.dtype.kind in "US":
-            arr = arr.astype(object)
         if arr.shape[1] != self.n_features_in_:
             raise ValueError("StandardScaler feature count changed.")
-        if arr.dtype.kind not in "iuf":
-            raise TypeError("StandardScaler requires real numeric values.")
-        arr = arr.astype(float)
+        arr = _real_numeric_array(arr, "StandardScaler")
         mean = np.asarray(self.mean_, dtype=float).reshape(-1)
         scale = np.asarray(self.scale_, dtype=float).reshape(-1)
         result = (arr - mean) / scale

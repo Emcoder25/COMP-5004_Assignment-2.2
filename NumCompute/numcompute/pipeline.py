@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .preprocessing import Imputer, MinMaxScaler, OneHotEncoder, StandardScaler
+from .metrics import accuracy
 
 
 def _require_transformer(transformer: object, message: str) -> "Transformer":
@@ -116,20 +117,48 @@ class FeatureUnion:
             transformer.fit(X)
         return self
 
+    def partial_fit(
+        self, X: npt.ArrayLike, y: npt.ArrayLike | None = None
+    ) -> "FeatureUnion":
+        """Incrementally update branches when supported, otherwise refit them."""
+        for _, transformer in self.transformer_list:
+            transformer = _require_transformer(
+                transformer, "each union step must implement fit and transform."
+            )
+            if hasattr(transformer, "partial_fit"):
+                transformer.partial_fit(X, y) if y is not None else transformer.partial_fit(X)
+            else:
+                transformer.fit(X, y) if y is not None else transformer.fit(X)
+        return self
+
     def transform(self, X: npt.ArrayLike) -> npt.NDArray[np.generic]:
-        """Concatenate two-dimensional transformer outputs along features."""
-        outputs = [
-            np.asarray(
+        """Concatenate branch outputs along features, treating vectors as columns."""
+        values = np.asarray(X)
+        if values.ndim == 0:
+            raise ValueError("FeatureUnion input must include a sample dimension.")
+        outputs = []
+        vector_output_indices: set[int] = set()
+        for _, transformer in self.transformer_list:
+            output = np.asarray(
                 _require_transformer(
                     transformer, "each union step must implement fit and transform."
                 ).transform(X)
             )
-            for _, transformer in self.transformer_list
-        ]
-        if any(output.ndim != 2 for output in outputs):
-            raise ValueError(
-                "FeatureUnion transformers must return two-dimensional arrays."
-            )
+            if output.ndim == 1:
+                vector_output_indices.add(len(outputs))
+                output = output.reshape(-1, 1)
+            if output.ndim != 2:
+                raise ValueError("FeatureUnion transformers must return vectors or matrices.")
+            if output.shape[0] != values.shape[0]:
+                raise ValueError("FeatureUnion outputs must have equal sample counts.")
+            outputs.append(output)
+        for index in vector_output_indices:
+            if any(
+                np.array_equal(outputs[index], other)
+                for other_index, other in enumerate(outputs)
+                if other_index != index
+            ):
+                raise ValueError("FeatureUnion transformers must return two-dimensional arrays.")
         if len({output.shape[0] for output in outputs}) != 1:
             raise ValueError("FeatureUnion outputs must have equal sample counts.")
         return np.concatenate(outputs, axis=1)
@@ -200,6 +229,8 @@ class Pipeline:
             # Each feature needs its own learned statistics and category set.
             feature_transformer = transformer if index == 0 else deepcopy(transformer)
             feature = values[:, index]
+            if isinstance(feature_transformer, StandardScaler):
+                feature = feature.reshape(-1, 1)
             feature_transformer.fit(feature)
             fitted.append(feature_transformer)
             outputs.append(
@@ -299,9 +330,15 @@ class Pipeline:
                 ):
                     outputs = []
                     fitted = []
+                    previous = self._fitted_transformers.get(name, [])
                     for index in range(current.shape[1]):
-                        feature_transformer = transformer if index == 0 else deepcopy(transformer)
+                        if index < len(previous):
+                            feature_transformer = previous[index]
+                        else:
+                            feature_transformer = transformer if index == 0 else deepcopy(transformer)
                         feature = current[:, index]
+                        if isinstance(feature_transformer, StandardScaler):
+                            feature = feature.reshape(-1, 1)
                         feature_transformer.partial_fit(feature)
                         fitted.append(feature_transformer)
                         outputs.append(self._as_2d_output(feature_transformer.transform(feature), current.shape[0]))
@@ -319,16 +356,22 @@ class Pipeline:
                 transformer.fit(current)
                 current = transformer.transform(current)
         final = self.steps[-1][1] if self.steps else None
-        if final is not None and hasattr(final, "partial_fit"):
+        if final is not None and hasattr(final, "predict"):
             if y is None:
                 raise ValueError("y is required when the final pipeline step is an estimator.")
-            final.partial_fit(current, y)
-        elif final is not None and hasattr(final, "fit"):
-            if y is None:
-                raise ValueError("y is required when the final pipeline step is an estimator.")
-            final.fit(current, y)
+            if hasattr(final, "partial_fit"):
+                final.partial_fit(current, y)
+            elif hasattr(final, "fit"):
+                final.fit(current, y)
+            else:
+                raise TypeError("the final estimator must implement fit or partial_fit.")
         self._is_fitted = True
         return self
+
+    @property
+    def is_fitted_(self) -> bool:
+        """Whether the pipeline has completed a fit or partial-fit operation."""
+        return self._is_fitted
 
     def transform(self, X: npt.ArrayLike) -> npt.ArrayLike:
         """Transform X through transformer steps, returning the final feature array.
@@ -375,3 +418,7 @@ class Pipeline:
         if not hasattr(final, "predict_proba"):
             raise AttributeError("the final pipeline step does not implement predict_proba.")
         return final.predict_proba(self.transform(X))
+
+    def score(self, X: npt.ArrayLike, y: npt.ArrayLike) -> float:
+        """Return classification accuracy for the fitted final estimator."""
+        return accuracy(y, self.predict(X))

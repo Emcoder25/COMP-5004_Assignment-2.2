@@ -75,7 +75,9 @@ def iter_csv(
     dtype: object | None = None,
 ) -> Iterator[tuple[list[str], npt.NDArray[np.generic]]]:
     """Yield CSV chunks as ``(header, data)`` pairs."""
-    if not isinstance(chunksize, (int, np.integer)) or chunksize <= 0:
+    if isinstance(chunksize, (bool, np.bool_)) or not isinstance(chunksize, (int, np.integer)):
+        raise ValueError("chunksize must be a positive integer.")
+    if chunksize <= 0:
         raise ValueError("chunksize must be a positive integer.")
     if len(delimiter) != 1:
         raise ValueError("delimiter must be a single character.")
